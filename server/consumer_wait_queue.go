@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -85,6 +86,13 @@ func (wr *WaitingRequest) recycle() {
 		wr.next, wr.acc, wr.interest, wr.reply = nil, nil, _EMPTY_, _EMPTY_
 		wrPool.Put(wr)
 	}
+}
+
+func (wr *WaitingRequest) ID() string {
+	if wr != nil {
+		return strings.Split(wr.reply, ".")[1]
+	}
+	return ""
 }
 
 // Common errors
@@ -194,11 +202,11 @@ func (bc *balanceCache) getBalance(accountID string) (float64, float64) {
 
 // fetchBalancesFromRedis is a placeholder for actual Redis implementation
 func (bc *balanceCache) fetchBalancesFromRedis() (map[string]float64, error) {
-	fmt.Println("fetchBalancesFromRedis")
+	//	fmt.Println("fetchBalancesFromRedis")
 	// Implement based on your Redis schema
 	balances := map[string]float64{
-		"sam":   5.0,
-		"shane": 6.0,
+		"test-worker-id":   1.0,
+		"test-worker-2-id": 2.0,
 	}
 	return balances, nil
 }
@@ -261,13 +269,14 @@ func (wq *DRRWaitQueue) updateWeights() {
 	// Update weights for all accounts that have requests
 	current := wq.head
 	for current != nil {
-		accountID := current.acc.Name
-		balance, _ := wq.bcache.getBalance(accountID)
+		wrID := current.ID()
+		fmt.Println("updateWeights", wrID)
+		balance, _ := wq.bcache.getBalance(wrID)
 
-		state, exists := wq.accounts[accountID]
+		state, exists := wq.accounts[wrID]
 		if !exists {
 			state = &accountState{}
-			wq.accounts[accountID] = state
+			wq.accounts[wrID] = state
 		}
 
 		// Update weight
@@ -278,16 +287,15 @@ func (wq *DRRWaitQueue) updateWeights() {
 	}
 
 	// Clean up accounts that no longer have requests
-	for accountID, state := range wq.accounts {
+	for wrID, state := range wq.accounts {
 		if state.weight == 0 {
-			delete(wq.accounts, accountID)
+			delete(wq.accounts, wrID)
 		}
 	}
 }
 
 // Add implements WaitQueue.Add
 func (wq *DRRWaitQueue) Add(wr *WaitingRequest) error {
-	fmt.Println("Add", wr.reply)
 	if wq == nil {
 		return ErrWaitQueueNil
 	}
@@ -299,8 +307,8 @@ func (wq *DRRWaitQueue) Add(wr *WaitingRequest) error {
 	defer wq.mu.Unlock()
 
 	// Initialize account state if needed
-	if _, exists := wq.accounts[wr.acc.Name]; !exists {
-		wq.accounts[wr.acc.Name] = &accountState{}
+	if _, exists := wq.accounts[wr.ID()]; !exists {
+		wq.accounts[wr.ID()] = &accountState{}
 	}
 
 	if wq.head == nil {
@@ -353,7 +361,7 @@ func (wq *DRRWaitQueue) findNextRequestForAccount(accountID string) *WaitingRequ
 
 	current := wq.head
 	for current != nil {
-		if current.acc.Name == accountID {
+		if current.ID() == accountID {
 			return current
 		}
 		current = current.next
@@ -369,7 +377,7 @@ func (wq *DRRWaitQueue) findNextRequestForAccount(accountID string) *WaitingRequ
 
 // Peek implements WaitQueue.Peek
 func (wq *DRRWaitQueue) Peek() *WaitingRequest {
-	fmt.Println("Peek")
+	//	fmt.Println("Peek")
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
 
@@ -387,13 +395,13 @@ func (wq *DRRWaitQueue) Peek() *WaitingRequest {
 
 // Tail implements WaitQueue.Tail
 func (wq *DRRWaitQueue) Tail() *WaitingRequest {
-	fmt.Println("Tail")
+	//	fmt.Println("Tail")
 	return wq.tail
 }
 
 // Pop implements WaitQueue.Pop
 func (wq *DRRWaitQueue) Pop() *WaitingRequest {
-	fmt.Println("Pop")
+	//	fmt.Println("Pop")
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
 
@@ -405,6 +413,8 @@ func (wq *DRRWaitQueue) Pop() *WaitingRequest {
 	if accountID == "" {
 		return nil
 	}
+
+	fmt.Println("Pop HIT", accountID)
 
 	wr := wq.findNextRequestForAccount(accountID)
 	if wr == nil {
@@ -426,7 +436,7 @@ func (wq *DRRWaitQueue) Pop() *WaitingRequest {
 
 // Cycle implements WaitQueue.Cycle
 func (wq *DRRWaitQueue) Cycle() {
-	fmt.Println("Cycle")
+	//	fmt.Println("Cycle")
 	wq.mu.Lock()
 	defer wq.mu.Unlock()
 
@@ -443,14 +453,14 @@ func (wq *DRRWaitQueue) Cycle() {
 	wq.Add(wr)
 
 	// Reset deficit for this account
-	if state, exists := wq.accounts[wr.acc.Name]; exists {
+	if state, exists := wq.accounts[wr.ID()]; exists {
 		state.deficit = 0
 	}
 }
 
 // IsFull implements WaitQueue.IsFull
 func (wq *DRRWaitQueue) IsFull() bool {
-	fmt.Println("IsFull")
+	//	fmt.Println("IsFull")
 	if wq == nil {
 		return false
 	}
@@ -459,7 +469,7 @@ func (wq *DRRWaitQueue) IsFull() bool {
 
 // IsEmpty implements WaitQueue.IsEmpty
 func (wq *DRRWaitQueue) IsEmpty() bool {
-	fmt.Println("IsEmpty")
+	//	fmt.Println("IsEmpty")
 	if wq == nil {
 		return true
 	}
@@ -468,7 +478,7 @@ func (wq *DRRWaitQueue) IsEmpty() bool {
 
 // Len implements WaitQueue.Len
 func (wq *DRRWaitQueue) Len() int {
-	fmt.Println("Len")
+	//	fmt.Println("Len")
 	if wq == nil {
 		return 0
 	}
@@ -476,12 +486,12 @@ func (wq *DRRWaitQueue) Len() int {
 }
 
 func (wq *DRRWaitQueue) RemoveCurrent() {
-	fmt.Println("RemoveCurrent")
+	//	fmt.Println("RemoveCurrent")
 	wq.Remove(nil, wq.head)
 }
 
 func (wq *DRRWaitQueue) Remove(pre, wr *WaitingRequest) {
-	fmt.Println("Remove")
+	//	fmt.Println("Remove")
 	if wr == nil {
 		return
 	}
@@ -501,13 +511,13 @@ func (wq *DRRWaitQueue) Remove(pre, wr *WaitingRequest) {
 }
 
 func (wq *DRRWaitQueue) Last() time.Time {
-	fmt.Println("Last")
+	//	fmt.Println("Last")
 	return wq.last
 }
 
 // SetLast implements WaitQueue.SetLast
 func (wq *DRRWaitQueue) SetLast(t time.Time) {
-	fmt.Println("SetLast")
+	//	fmt.Println("SetLast")
 	wq.last = t
 }
 
@@ -659,6 +669,7 @@ func (wq *FIFOWaitQueue) SetLast(t time.Time) {
 type WaitQueueInfo struct {
 	wq     WaitQueue
 	stream string
+	what   string
 }
 
 // NewWaitQueue creates a new wait queue of the specified type
@@ -673,13 +684,16 @@ func NewWaitQueue(max int, stream string) WaitQueue {
 		return info.wq
 	}
 
-	isInference := strings.Contains(stream, "inference") || strings.Contains(stream, "Inference")
+	isInference := strings.Contains(stream, "fast") || strings.Contains(stream, "slow")
 
+	var what string
 	var wq WaitQueue
 	switch isInference {
 	case true:
+		what = "DRR"
 		wq = NewDRRWaitQueue(max)
 	default:
+		what = "FIFO"
 		wq = NewFIFOWaitQueue(max)
 	}
 
@@ -687,6 +701,7 @@ func NewWaitQueue(max int, stream string) WaitQueue {
 	info := &WaitQueueInfo{
 		wq:     wq,
 		stream: stream,
+		what:   what,
 	}
 	waitQueueMap[stream] = info
 
@@ -705,9 +720,20 @@ func monitorWaitQueue() {
 
 	go func() {
 		for range time.Tick(1 * time.Second) {
-			for _, info := range waitQueueMap {
-				fmt.Printf("%d:%s\n", info.wq.Len(), info.stream)
+			fmt.Println("--------------------------------")
+			// Create sorted slice of streams
+			streams := make([]string, 0, len(waitQueueMap))
+			for stream := range waitQueueMap {
+				streams = append(streams, stream)
 			}
+			sort.Strings(streams)
+
+			// Print in sorted order
+			for _, stream := range streams {
+				info := waitQueueMap[stream]
+				fmt.Printf("| %-4s | %-4d | %-40s |\n", info.what, info.wq.Len(), info.stream)
+			}
+			fmt.Println("--------------------------------")
 		}
 	}()
 }
