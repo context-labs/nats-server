@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"math/rand"
 	"reflect"
 	"regexp"
@@ -32,7 +31,6 @@ import (
 
 	"github.com/nats-io/nats-server/v2/server/avl"
 	"github.com/nats-io/nuid"
-	"github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
 )
 
@@ -438,7 +436,7 @@ type consumer struct {
 	rdc               map[uint64]uint64
 	replies           map[uint64]string
 	maxdc             uint64
-	waiting           *waitQueue
+	waiting           WaitQueue
 	cfg               ConsumerConfig
 	ici               *ConsumerInfo
 	store             ConsumerStore
@@ -1054,7 +1052,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 
 	// Create our request waiting queue.
 	if o.isPullMode() {
-		o.waiting = newWaitQueue(config.MaxWaiting)
+		o.waiting = NewWaitQueue(config.MaxWaiting, o.name)
 		// Create our internal queue for next msg requests.
 		o.nextMsgReqs = newIPQueue[*nextMsgReq](s, fmt.Sprintf("[ACC:%s] consumer '%s' on stream '%s' pull requests", accName, o.name, cfg.Name))
 	}
@@ -1540,7 +1538,8 @@ func (o *consumer) setLeader(isLeader bool) {
 		}
 		// Reset waiting if we are in pull mode.
 		if o.isPullMode() {
-			o.waiting = newWaitQueue(o.cfg.MaxWaiting)
+			o.waiting = NewWaitQueue(o.cfg.MaxWaiting, o.name)
+
 			o.nextMsgReqs.drain()
 		} else if o.srv.gateway.enabled {
 			stopAndClearTimer(&o.gwdtmr)
@@ -1838,7 +1837,7 @@ func (o *consumer) deleteNotActive() {
 		}
 	} else {
 		// Pull mode.
-		elapsed := time.Since(o.waiting.last)
+		elapsed := time.Since(o.waiting.Last())
 		if elapsed <= o.cfg.InactiveThreshold {
 			// These need to keep firing so reset but use delta.
 			if o.dtmr != nil {
@@ -2604,7 +2603,7 @@ func (o *consumer) checkPendingRequests() {
 // Should be called only by the leader being deleted or stopped.
 // Lock should be held.
 func (o *consumer) releaseAnyPendingRequests(isAssigned bool) {
-	if o.mset == nil || o.outq == nil || o.waiting.len() == 0 {
+	if o.mset == nil || o.outq == nil || o.waiting.Len() == 0 {
 		return
 	}
 	var hdr []byte
@@ -2613,7 +2612,7 @@ func (o *consumer) releaseAnyPendingRequests(isAssigned bool) {
 	}
 
 	wq := o.waiting
-	for wr := wq.head; wr != nil; {
+	for wr := wq.Peek(); wr != nil; {
 		if hdr != nil {
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 		}
@@ -2986,7 +2985,7 @@ func (o *consumer) infoWithSnapAndReply(snap bool, reply string) *ConsumerInfo {
 	// If we are a pull mode consumer, report on number of waiting requests.
 	if o.isPullMode() {
 		o.processWaiting(false)
-		info.NumWaiting = o.waiting.len()
+		info.NumWaiting = o.waiting.Len()
 	}
 	// If we were asked to snapshot do so here.
 	if snap {
@@ -3363,457 +3362,21 @@ func nextReqFromMsg(msg []byte) (time.Time, int, int, bool, time.Duration, time.
 	return time.Time{}, 1, 0, false, 0, time.Time{}, nil, nil
 }
 
-// Represents a request that is on the internal waiting queue
-type waitingRequest struct {
-	next          *waitingRequest
-	acc           *Account
-	interest      string
-	reply         string
-	n             int // For batching
-	d             int // num delivered
-	b             int // For max bytes tracking
-	expires       time.Time
-	received      time.Time
-	hb            time.Duration
-	hbt           time.Time
-	noWait        bool
-	priorityGroup *PriorityGroup
-}
-
 // sync.Pool for waiting requests.
 var wrPool = sync.Pool{
 	New: func() any {
-		return new(waitingRequest)
+		return new(WaitingRequest)
 	},
-}
-
-// Recycle this request. This request can not be accessed after this call.
-func (wr *waitingRequest) recycleIfDone() bool {
-	if wr != nil && wr.n <= 0 {
-		wr.recycle()
-		return true
-	}
-	return false
-}
-
-// Force a recycle.
-func (wr *waitingRequest) recycle() {
-	if wr != nil {
-		wr.next, wr.acc, wr.interest, wr.reply = nil, nil, _EMPTY_, _EMPTY_
-		wrPool.Put(wr)
-	}
-}
-
-// Global variables for Redis client and balance cache
-var (
-	globalRedis        *redis.Client
-	globalBalanceCache *balanceCache
-	balanceCacheOnce   sync.Once
-)
-
-// SetGlobalRedis sets up the global Redis client for all wait queues
-func SetGlobalRedis(redisClient *redis.Client) {
-	globalRedis = redisClient
-}
-
-// balanceCache maintains the current account balances and related stats
-type balanceCache struct {
-	sync.RWMutex
-	balances     map[string]float64
-	totalBalance float64
-	lastUpdate   time.Time
-}
-
-// getBalanceCache returns the singleton balance cache instance
-func getBalanceCache() *balanceCache {
-	balanceCacheOnce.Do(func() {
-		// if globalRedis == nil {
-		// 	panic("global Redis client not initialized")
-		// }
-		globalBalanceCache = &balanceCache{
-			balances: make(map[string]float64),
-		}
-		// Start balance updater
-		go globalBalanceCache.balanceUpdater()
-	})
-	return globalBalanceCache
-}
-
-// balanceUpdater periodically updates balances from Redis
-func (bc *balanceCache) balanceUpdater() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if err := bc.updateBalances(); err != nil {
-			// Handle error, maybe log it
-			continue
-		}
-	}
-}
-
-// updateBalances fetches current balances and updates weights
-func (bc *balanceCache) updateBalances() error {
-	// Fetch balances from Redis
-	balances, err := bc.fetchBalancesFromRedis()
-	if err != nil {
-		return err
-	}
-
-	bc.Lock()
-	defer bc.Unlock()
-
-	// Reset total balance
-	bc.totalBalance = 0
-
-	// Update balances
-	for accountID, balance := range balances {
-		bc.balances[accountID] = balance
-		bc.totalBalance += balance
-	}
-
-	// Remove accounts that no longer exist
-	for accountID := range bc.balances {
-		if _, exists := balances[accountID]; !exists {
-			delete(bc.balances, accountID)
-		}
-	}
-
-	bc.lastUpdate = time.Now()
-	return nil
-}
-
-// getBalance returns the balance and proportion for an account
-func (bc *balanceCache) getBalance(accountID string) (float64, float64) {
-	bc.RLock()
-	defer bc.RUnlock()
-
-	balance := bc.balances[accountID]
-	proportion := 0.0
-	if bc.totalBalance > 0 {
-		proportion = balance / bc.totalBalance
-	}
-	return balance, proportion
-}
-
-// fetchBalancesFromRedis is a placeholder for actual Redis implementation
-func (bc *balanceCache) fetchBalancesFromRedis() (map[string]float64, error) {
-	// Implement based on your Redis schema
-	balances := map[string]float64{
-		"sam":   5.0,
-		"shane": 6.0,
-	}
-	return balances, nil
-}
-
-// accountState tracks only the minimal required DRR state
-type accountState struct {
-	deficit int64 // Current deficit counter
-	weight  int64 // Weight computed from balance
-}
-
-// waitQueue extends the original implementation with DRR scheduling
-type waitQueue struct {
-	mu     sync.RWMutex
-	n, max int
-	last   time.Time
-	head   *waitingRequest
-	tail   *waitingRequest
-
-	// DRR scheduling state
-	accounts    map[string]*accountState
-	quantum     int64
-	totalWeight int64
-	bcache      *balanceCache
-}
-
-// Create a new ring buffer with at most max items.
-func newWaitQueue(max int) *waitQueue {
-	wq := &waitQueue{
-		max:      max,
-		accounts: make(map[string]*accountState),
-		quantum:  1000, // Use 1000 as base quantum for more granular scheduling
-		bcache:   getBalanceCache(),
-	}
-
-	// Start weight updater
-	go wq.weightUpdater()
-
-	return wq
-}
-
-var (
-	errWaitQueueFull = errors.New("wait queue is full")
-	errWaitQueueNil  = errors.New("wait queue is nil")
-)
-
-// weightUpdater periodically updates weights based on current balances
-func (wq *waitQueue) weightUpdater() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		wq.updateWeights()
-	}
-}
-
-// updateWeights updates the DRR weights based on current balances
-func (wq *waitQueue) updateWeights() {
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	// Reset total weight
-	wq.totalWeight = 0
-
-	// Update weights for all accounts that have requests
-	current := wq.head
-	for current != nil {
-		accountID := current.acc.Name
-		balance, _ := wq.bcache.getBalance(accountID)
-
-		state, exists := wq.accounts[accountID]
-		if !exists {
-			state = &accountState{}
-			wq.accounts[accountID] = state
-		}
-
-		// Update weight
-		state.weight = int64(balance * float64(wq.quantum))
-		wq.totalWeight += state.weight
-
-		current = current.next
-	}
-
-	// Clean up accounts that no longer have requests
-	for accountID, state := range wq.accounts {
-		if state.weight == 0 {
-			delete(wq.accounts, accountID)
-		}
-	}
-}
-
-// Adds in a new request.
-func (wq *waitQueue) add(wr *waitingRequest) error {
-	if wq == nil {
-		return errWaitQueueNil
-	}
-	if wq.isFull() {
-		return errWaitQueueFull
-	}
-
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	// Initialize account state if needed
-	if _, exists := wq.accounts[wr.acc.Name]; !exists {
-		wq.accounts[wr.acc.Name] = &accountState{}
-	}
-
-	if wq.head == nil {
-		wq.head = wr
-	} else {
-		wq.tail.next = wr
-	}
-	// Always set tail.
-	wq.tail = wr
-	// Make sure nil
-	wr.next = nil
-
-	// Track last active via when we receive a request.
-	wq.last = wr.received
-	wq.n++
-	return nil
-}
-
-// selectNextAccount uses DRR to select the next account to service
-func (wq *waitQueue) selectNextAccount() string {
-	if len(wq.accounts) == 0 {
-		return ""
-	}
-
-	var selectedID string
-	var minDeficit int64 = math.MaxInt64
-
-	// Select account with lowest deficit
-	for accountID, state := range wq.accounts {
-		if state.deficit < minDeficit {
-			minDeficit = state.deficit
-			selectedID = accountID
-		}
-	}
-
-	if selectedID == "" {
-		return ""
-	}
-
-	// Increase deficit by totalWeight / weight for the selected account
-	if state := wq.accounts[selectedID]; state.weight > 0 {
-		state.deficit += wq.totalWeight / state.weight
-	}
-
-	return selectedID
-}
-
-// findNextRequestForAccount finds the next request for the given account
-func (wq *waitQueue) findNextRequestForAccount(accountID string) *waitingRequest {
-	if accountID == "" {
-		return nil
-	}
-
-	// Start at the head of the wait queue
-	current := wq.head
-	for current != nil {
-		if current.acc.Name == accountID {
-			return current
-		}
-		current = current.next
-	}
-
-	// If we didn't find a request, reset the deficit for this account
-	if state, exists := wq.accounts[accountID]; exists {
-		state.deficit = 0
-	}
-
-	return nil
-}
-
-// cycle will move current head request to the end if valid.
-func (wq *waitQueue) cycle() {
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	if wq.isEmpty() {
-		return
-	}
-
-	// Get current head request
-	wr := wq.head
-	if wr == nil {
-		return
-	}
-
-	// If it's the only request, nothing to do
-	if wq.n == 1 {
-		return
-	}
-
-	// Move to end
-	wq.removeCurrent()
-	wq.add(wr)
-
-	// Reset deficit for this account as we're allowing it to be reconsidered
-	if state, exists := wq.accounts[wr.acc.Name]; exists {
-		state.deficit = 0
-	}
-}
-
-// peek will return the next request using DRR scheduling
-func (wq *waitQueue) peek() *waitingRequest {
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	if wq.isEmpty() {
-		return nil
-	}
-
-	// Select next account using DRR
-	accountID := wq.selectNextAccount()
-	if accountID == "" {
-		return nil
-	}
-
-	// Find next request for this account
-	return wq.findNextRequestForAccount(accountID)
-}
-
-// pop will return the next request using DRR scheduling
-func (wq *waitQueue) pop() *waitingRequest {
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	if wq.isEmpty() {
-		return nil
-	}
-
-	// Select next account using DRR
-	accountID := wq.selectNextAccount()
-	if accountID == "" {
-		return nil
-	}
-
-	// Find next request for this account
-	wr := wq.findNextRequestForAccount(accountID)
-	if wr == nil {
-		return nil
-	}
-
-	// Update request state
-	wr.d++
-	wr.n--
-
-	// Handle the request in the queue
-	if wr.n > 0 && wq.n > 1 {
-		wq.removeCurrent()
-		wq.add(wr)
-	} else if wr.n <= 0 {
-		wq.removeCurrent()
-	}
-
-	return wr
-}
-
-func (wq *waitQueue) isFull() bool {
-	if wq == nil {
-		return false
-	}
-	return wq.n == wq.max
-}
-
-func (wq *waitQueue) isEmpty() bool {
-	if wq == nil {
-		return true
-	}
-	return wq.n == 0
-}
-
-func (wq *waitQueue) len() int {
-	if wq == nil {
-		return 0
-	}
-	return wq.n
-}
-
-func (wq *waitQueue) removeCurrent() {
-	wq.remove(nil, wq.head)
-}
-
-func (wq *waitQueue) remove(pre, wr *waitingRequest) {
-	if wr == nil {
-		return
-	}
-	if pre != nil {
-		pre.next = wr.next
-	} else if wr == wq.head {
-		wq.head = wr.next
-	}
-	if wr == wq.tail {
-		if wr.next == nil {
-			wq.tail = pre
-		} else {
-			wq.tail = wr.next
-		}
-	}
-	wq.n--
 }
 
 // Return the map of pending requests keyed by the reply subject.
 // No-op if push consumer or invalid etc.
-func (o *consumer) pendingRequests() map[string]*waitingRequest {
+func (o *consumer) pendingRequests() map[string]*WaitingRequest {
 	if o.waiting == nil {
 		return nil
 	}
-	wq, m := o.waiting, make(map[string]*waitingRequest)
-	for wr := wq.head; wr != nil; wr = wr.next {
+	wq, m := o.waiting, make(map[string]*WaitingRequest)
+	for wr := wq.Peek(); wr != nil; wr = wr.next {
 		m[wr.reply] = wr
 	}
 
@@ -3838,8 +3401,8 @@ func (o *consumer) setPinnedTimer(priorityGroup string) {
 // Return next waiting request. This will check for expirations but not noWait or interest.
 // That will be handled by processWaiting.
 // Lock should be held.
-func (o *consumer) nextWaiting(sz int) *waitingRequest {
-	if o.waiting == nil || o.waiting.isEmpty() {
+func (o *consumer) nextWaiting(sz int) *WaitingRequest {
+	if o.waiting == nil || o.waiting.IsEmpty() {
 		return nil
 	}
 
@@ -3851,8 +3414,8 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 		priorityGroup = o.cfg.PriorityGroups[0]
 	}
 
-	lastRequest := o.waiting.tail
-	for wr := o.waiting.peek(); !o.waiting.isEmpty(); wr = o.waiting.peek() {
+	lastRequest := o.waiting.Tail()
+	for wr := o.waiting.Peek(); wr != nil; wr = wr.next {
 		if wr == nil {
 			break
 		}
@@ -3871,7 +3434,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				hdr := fmt.Appendf(nil, maxBytesT, JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 				o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 				// Remove the current one, no longer valid due to max bytes limit.
-				o.waiting.removeCurrent()
+				o.waiting.RemoveCurrent()
 				if o.node != nil {
 					o.removeClusterPendingRequest(wr.reply)
 				}
@@ -3891,7 +3454,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 					// There is pin id set, but not a matching one. Send a notification to the client and remove the request.
 					// Probably this is the old pin id.
 					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, []byte(JSPullRequestWrongPinID), nil, nil, 0))
-					o.waiting.removeCurrent()
+					o.waiting.RemoveCurrent()
 					if o.node != nil {
 						o.removeClusterPendingRequest(wr.reply)
 					}
@@ -3903,7 +3466,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				if wr.priorityGroup != nil && wr.priorityGroup.Id == o.currentPinId {
 					// If we have a match, we do nothing here and will deliver the message later down the code path.
 				} else if wr.priorityGroup.Id == _EMPTY_ {
-					o.waiting.cycle()
+					o.waiting.Cycle()
 					if wr == lastRequest {
 						return nil
 					}
@@ -3911,7 +3474,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				} else {
 					// There is pin id set, but not a matching one. Send a notification to the client and remove the request.
 					o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, []byte(JSPullRequestWrongPinID), nil, nil, 0))
-					o.waiting.removeCurrent()
+					o.waiting.RemoveCurrent()
 					if o.node != nil {
 						o.removeClusterPendingRequest(wr.reply)
 					}
@@ -3925,7 +3488,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 					// We need to check o.npc+1, because before calling nextWaiting, we do o.npc--
 					(wr.priorityGroup.MinPending > 0 && wr.priorityGroup.MinPending > o.npc+1 ||
 						wr.priorityGroup.MinAckPending > 0 && wr.priorityGroup.MinAckPending > int64(len(o.pending))) {
-					o.waiting.cycle()
+					o.waiting.Cycle()
 					// We're done cycling through the requests.
 					if wr == lastRequest {
 						return nil
@@ -3937,23 +3500,23 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 				if needNewPin {
 					o.sendPinnedAdvisoryLocked(priorityGroup)
 				}
-				return o.waiting.pop()
+				return o.waiting.Pop()
 			} else if time.Since(wr.received) < defaultGatewayRecentSubExpiration && (o.srv.leafNodeEnabled || o.srv.gateway.enabled) {
 				if needNewPin {
 					o.sendPinnedAdvisoryLocked(priorityGroup)
 				}
-				return o.waiting.pop()
+				return o.waiting.Pop()
 			} else if o.srv.gateway.enabled && o.srv.hasGatewayInterest(wr.acc.Name, wr.interest) {
 				if needNewPin {
 					o.sendPinnedAdvisoryLocked(priorityGroup)
 				}
-				return o.waiting.pop()
+				return o.waiting.Pop()
 			}
 		} else {
 			// We do check for expiration in `processWaiting`, but it is possible to hit the expiry here, and not there.
 			hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
-			o.waiting.removeCurrent()
+			o.waiting.RemoveCurrent()
 			if o.node != nil {
 				o.removeClusterPendingRequest(wr.reply)
 			}
@@ -3967,7 +3530,7 @@ func (o *consumer) nextWaiting(sz int) *waitingRequest {
 			o.outq.send(newJSPubMsg(wr.reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 		}
 		// Remove the current one, no longer valid.
-		o.waiting.removeCurrent()
+		o.waiting.RemoveCurrent()
 		if o.node != nil {
 			o.removeClusterPendingRequest(wr.reply)
 		}
@@ -4108,7 +3671,7 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	}
 
 	// If we have the max number of requests already pending try to expire.
-	if o.waiting.isFull() {
+	if o.waiting.IsFull() {
 		// Try to expire some of the requests.
 		// We do not want to push too hard here so at maximum process once per sec.
 		if time.Since(o.lwqic) > time.Second {
@@ -4122,14 +3685,14 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 		// If no pending at all, decide what to do with request.
 		// If no expires was set then fail.
 		if msgsPending == 0 && expires.IsZero() {
-			o.waiting.last = time.Now()
+			o.waiting.SetLast(time.Now())
 			sendErr(404, "No Messages")
 			return
 		}
 		if msgsPending > 0 {
 			_, _, batchPending, _ := o.processWaiting(false)
 			if msgsPending < uint64(batchPending) {
-				o.waiting.last = time.Now()
+				o.waiting.SetLast(time.Now())
 				sendErr(408, "Requests Pending")
 				return
 			}
@@ -4142,12 +3705,13 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	acc, interest := trackDownAccountAndInterest(o.acc, reply)
 
 	// Create a waiting request.
-	wr := wrPool.Get().(*waitingRequest)
+	wr := wrPool.Get().(*WaitingRequest)
 	wr.acc, wr.interest, wr.reply, wr.n, wr.d, wr.noWait, wr.expires, wr.hb, wr.hbt, wr.priorityGroup = acc, interest, reply, batchSize, 0, noWait, expires, hb, hbt, priorityGroup
 	wr.b = maxBytes
 	wr.received = time.Now()
 
-	if err := o.waiting.add(wr); err != nil {
+	fmt.Println("Adding waiting request for consumer ", o.name, "on stream ", o.stream, "with reply ", reply, "and interest ", interest, "and claim ", acc.claimJWT)
+	if err := o.waiting.Add(wr); err != nil {
 		sendErr(409, "Exceeded MaxWaiting")
 		wr.recycle()
 		return
@@ -4382,7 +3946,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 // Will also do any heartbeats and return the next expiration or HB interval.
 func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 	var fexp time.Time
-	if o.srv == nil || o.waiting.isEmpty() {
+	if o.srv == nil || o.waiting.IsEmpty() {
 		return 0, 0, 0, fexp
 	}
 	// Mark our last check time.
@@ -4392,19 +3956,19 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 	s, now := o.srv, time.Now()
 
 	wq := o.waiting
-	remove := func(pre, wr *waitingRequest) *waitingRequest {
+	remove := func(pre, wr *WaitingRequest) *WaitingRequest {
 		expired++
 		if o.node != nil {
 			o.removeClusterPendingRequest(wr.reply)
 		}
 		next := wr.next
-		wq.remove(pre, wr)
+		wq.Remove(pre, wr)
 		wr.recycle()
 		return next
 	}
 
-	var pre *waitingRequest
-	for wr := wq.head; wr != nil; {
+	var pre *WaitingRequest
+	for wr := wq.Peek(); wr != nil; {
 		// Check expiration.
 		if (eos && wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
 			hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
@@ -4451,13 +4015,13 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 		wr = wr.next
 	}
 
-	return expired, wq.len(), brp, fexp
+	return expired, o.waiting.Len(), brp, fexp
 }
 
 // Will check to make sure those waiting still have registered interest.
 func (o *consumer) checkWaitingForInterest() bool {
 	o.processWaiting(true)
-	return o.waiting.len() > 0
+	return o.waiting.Len() > 0
 }
 
 // Lock should be held.
@@ -4652,7 +4216,7 @@ func (o *consumer) suppressDeletion() {
 		o.dtmr.Reset(o.dthresh)
 	} else if o.isPullMode() && o.waiting != nil {
 		// Pull mode always has timer running, just update last on waiting queue.
-		o.waiting.last = time.Now()
+		o.waiting.SetLast(time.Now())
 	}
 }
 
@@ -4736,7 +4300,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			if !o.active || (o.maxpb > 0 && o.pbytes > o.maxpb) {
 				goto waitForMsgs
 			}
-		} else if o.waiting.isEmpty() {
+		} else if o.waiting.IsEmpty() {
 			// If we are in pull mode and no one is waiting already break and wait.
 			goto waitForMsgs
 		}
@@ -5105,7 +4669,7 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 
 	// If pull mode and we have inactivity threshold, signaled by dthresh, update last activity.
 	if o.isPullMode() && o.dthresh > 0 {
-		o.waiting.last = time.Now()
+		o.waiting.SetLast(time.Now())
 	}
 
 	// If we are ack none and mset is interest only we should make sure stream removes interest.
@@ -5228,7 +4792,7 @@ func (o *consumer) trackPending(sseq, dseq uint64) {
 // lock should be held.
 func (o *consumer) creditWaitingRequest(reply string) {
 	wq := o.waiting
-	for wr := wq.head; wr != nil; wr = wr.next {
+	for wr := wq.Peek(); wr != nil; wr = wr.next {
 		if wr.reply == reply {
 			wr.n++
 			wr.d--
@@ -5265,7 +4829,7 @@ func (o *consumer) didNotDeliver(seq uint64, subj string) {
 			// we know it was not delivered
 			if !o.onRedeliverQueue(seq) {
 				o.addToRedeliverQueue(seq)
-				if !o.waiting.isEmpty() {
+				if !o.waiting.IsEmpty() {
 					o.signalNewMessages()
 				}
 			}
@@ -6193,7 +5757,7 @@ func (o *consumer) processStreamSignal(_ *subscription, _ *client, _ *Account, s
 	if seq < o.sseq {
 		return
 	}
-	if o.isPushMode() && o.active || o.isPullMode() && !o.waiting.isEmpty() {
+	if o.isPushMode() && o.active || o.isPullMode() && !o.waiting.IsEmpty() {
 		o.signalNewMessages()
 	}
 }
