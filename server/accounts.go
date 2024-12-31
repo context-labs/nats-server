@@ -52,62 +52,56 @@ var maxSubLimitReportThreshold = defaultMaxSubLimitReportThreshold
 type Account struct {
 	stats
 	gwReplyMapping
-	Name         string
-	LogicalName  string
-	Nkey         string
-	Issuer       string
-	claimJWT     string
-	updated      time.Time
-	mu           sync.RWMutex
-	sqmu         sync.Mutex
-	sl           *Sublist
-	ic           *client
-	sq           *sendq
-	isid         uint64
-	etmr         *time.Timer
-	ctmr         *time.Timer
-	strack       map[string]sconns
-	nrclients    int32
-	sysclients   int32
-	nleafs       int32
-	nrleafs      int32
-	clients      map[*client]struct{}
-	rm           map[string]int32
-	lqws         map[string]int32
-	usersRevoked map[string]int64
-	mappings     []*mapping
-	hasMapped    atomic.Bool
-	lmu          sync.RWMutex
-	lleafs       []*client
-	leafClusters map[string]uint64
-	imports      importMap
-	exports      exportMap
-	js           *jsAccount
-	jsLimits     map[string]JetStreamAccountLimits
+	Name         string                            `json:"name"`
+	LogicalName  string                            `json:"logical_name"`
+	Nkey         string                            `json:"nkey"`
+	Issuer       string                            `json:"issuer"`
+	claimJWT     string                            `json:"claim_jwt"`
+	updated      time.Time                         `json:"updated"`
+	mu           sync.RWMutex                      `json:"-"`
+	sqmu         sync.Mutex                        `json:"-"`
+	sl           *Sublist                          `json:"-"`
+	ic           *client                           `json:"-"`
+	sq           *sendq                            `json:"-"`
+	isid         uint64                            `json:"isid"`
+	etmr         *time.Timer                       `json:"-"`
+	ctmr         *time.Timer                       `json:"-"`
+	strack       map[string]sconns                 `json:"-"`
+	nrclients    int32                             `json:"nr_clients"`
+	sysclients   int32                             `json:"sys_clients"`
+	nleafs       int32                             `json:"nleafs"`
+	nrleafs      int32                             `json:"nr_leafs"`
+	clients      map[*client]struct{}              `json:"-"`
+	rm           map[string]int32                  `json:"-"`
+	lqws         map[string]int32                  `json:"-"`
+	usersRevoked map[string]int64                  `json:"-"`
+	mappings     []*mapping                        `json:"-"`
+	hasMapped    atomic.Bool                       `json:"-"`
+	lmu          sync.RWMutex                      `json:"-"`
+	lleafs       []*client                         `json:"-"`
+	leafClusters map[string]uint64                 `json:"-"`
+	imports      importMap                         `json:"-"`
+	exports      exportMap                         `json:"-"`
+	js           *jsAccount                        `json:"-"`
+	jsLimits     map[string]JetStreamAccountLimits `json:"-"`
 	limits
-	expired      atomic.Bool
-	incomplete   bool
-	signingKeys  map[string]jwt.Scope
-	extAuth      *jwt.ExternalAuthorization
-	srv          *Server // server this account is registered with (possibly nil)
-	lds          string  // loop detection subject for leaf nodes
-	siReply      []byte  // service reply prefix, will form wildcard subscription.
-	eventIds     *nuid.NUID
-	eventIdsMu   sync.Mutex
-	defaultPerms *Permissions
-	tags         jwt.TagList
-	nameTag      string
-	lastLimErr   int64
-	routePoolIdx int
-	// If the trace destination is specified and a message with a traceParentHdr
-	// is received, and has the least significant bit of the last token set to 1,
-	// then if traceDestSampling is > 0 and < 100, a random value will be selected
-	// and if it falls between 0 and that value, message tracing will be triggered.
-	traceDest         string
-	traceDestSampling int
-	// Guarantee that only one goroutine can be running either checkJetStreamMigrate
-	// or clearObserverState at a given time for this account to prevent interleaving.
-	jscmMu sync.Mutex
+	expired           atomic.Bool                `json:"-"`
+	incomplete        bool                       `json:"incomplete"`
+	signingKeys       map[string]jwt.Scope       `json:"-"`
+	extAuth           *jwt.ExternalAuthorization `json:"-"`
+	srv               *Server                    `json:"-"`
+	lds               string                     `json:"lds"`
+	siReply           []byte                     `json:"-"`
+	eventIds          *nuid.NUID                 `json:"-"`
+	eventIdsMu        sync.Mutex                 `json:"-"`
+	defaultPerms      *Permissions               `json:"-"`
+	tags              jwt.TagList                `json:"-"`
+	nameTag           string                     `json:"name_tag"`
+	lastLimErr        int64                      `json:"last_lim_err"`
+	routePoolIdx      int                        `json:"route_pool_idx"`
+	traceDest         string                     `json:"trace_dest"`
+	traceDestSampling int                        `json:"trace_dest_sampling"`
+	jscmMu            sync.Mutex                 `json:"-"`
 }
 
 const (
