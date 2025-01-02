@@ -12,6 +12,50 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+// WaitingRequest represents a request in the queue
+type WaitingRequest struct {
+	next          *WaitingRequest
+	acc           *Account
+	interest      string
+	reply         string
+	n             int // For batching
+	d             int // num delivered
+	b             int // For max bytes tracking
+	expires       time.Time
+	received      time.Time
+	hb            time.Duration
+	hbt           time.Time
+	noWait        bool
+	priorityGroup *PriorityGroup
+}
+
+// Recycle this request. This request can not be accessed after this call.
+func (wr *WaitingRequest) recycleIfDone() bool {
+	if wr != nil && wr.n <= 0 {
+		wr.recycle()
+		return true
+	}
+	return false
+}
+
+// Force a recycle.
+func (wr *WaitingRequest) recycle() {
+	if wr != nil {
+		wr.next, wr.acc, wr.interest, wr.reply = nil, nil, _EMPTY_, _EMPTY_
+		wrPool.Put(wr)
+	}
+}
+
+func (wr *WaitingRequest) ID() string {
+	if wr != nil && wr.reply != "" {
+		parts := strings.Split(wr.reply, ".")
+		if len(parts) > 1 {
+			return parts[1]
+		}
+	}
+	return ""
+}
+
 // WaitQueue represents a priority queue that handles waiting requests
 type WaitQueue interface {
 	// Add adds a new request to the queue
@@ -52,47 +96,6 @@ type WaitQueue interface {
 
 	// SetLast sets the last active time
 	SetLast(t time.Time)
-}
-
-// WaitingRequest represents a request in the queue
-type WaitingRequest struct {
-	next          *WaitingRequest
-	acc           *Account
-	interest      string
-	reply         string
-	n             int // For batching
-	d             int // num delivered
-	b             int // For max bytes tracking
-	expires       time.Time
-	received      time.Time
-	hb            time.Duration
-	hbt           time.Time
-	noWait        bool
-	priorityGroup *PriorityGroup
-}
-
-// Recycle this request. This request can not be accessed after this call.
-func (wr *WaitingRequest) recycleIfDone() bool {
-	if wr != nil && wr.n <= 0 {
-		wr.recycle()
-		return true
-	}
-	return false
-}
-
-// Force a recycle.
-func (wr *WaitingRequest) recycle() {
-	if wr != nil {
-		wr.next, wr.acc, wr.interest, wr.reply = nil, nil, _EMPTY_, _EMPTY_
-		wrPool.Put(wr)
-	}
-}
-
-func (wr *WaitingRequest) ID() string {
-	if wr != nil {
-		return strings.Split(wr.reply, ".")[1]
-	}
-	return ""
 }
 
 // Common errors
@@ -266,65 +269,41 @@ func (wq *DRRWaitQueue) updateWeights() {
 	// Reset total weight
 	wq.totalWeight = 0
 
+	// Keep track of seen accounts
+	seenAccounts := make(map[string]bool)
+
 	// Update weights for all accounts that have requests
 	current := wq.head
 	for current != nil {
-		wrID := current.ID()
-		fmt.Println("updateWeights", wrID)
-		balance, _ := wq.bcache.getBalance(wrID)
+		accountID := current.ID()
+		seenAccounts[accountID] = true
 
-		state, exists := wq.accounts[wrID]
+		balance, _ := wq.bcache.getBalance(accountID)
+
+		state, exists := wq.accounts[accountID]
 		if !exists {
 			state = &accountState{}
-			wq.accounts[wrID] = state
+			wq.accounts[accountID] = state
 		}
 
 		// Update weight
 		state.weight = int64(balance * float64(wq.quantum))
+		if state.weight == 0 {
+			state.weight = 1 // Minimum weight to prevent division by zero
+		}
 		wq.totalWeight += state.weight
 
 		current = current.next
 	}
 
 	// Clean up accounts that no longer have requests
-	for wrID, state := range wq.accounts {
-		if state.weight == 0 {
-			delete(wq.accounts, wrID)
+	for accountID := range wq.accounts {
+		if !seenAccounts[accountID] {
+			delete(wq.accounts, accountID)
 		}
 	}
 }
 
-// Add implements WaitQueue.Add
-func (wq *DRRWaitQueue) Add(wr *WaitingRequest) error {
-	if wq == nil {
-		return ErrWaitQueueNil
-	}
-	if wq.IsFull() {
-		return ErrWaitQueueFull
-	}
-
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	// Initialize account state if needed
-	if _, exists := wq.accounts[wr.ID()]; !exists {
-		wq.accounts[wr.ID()] = &accountState{}
-	}
-
-	if wq.head == nil {
-		wq.head = wr
-	} else {
-		wq.tail.next = wr
-	}
-	wq.tail = wr
-	wr.next = nil
-
-	wq.last = wr.received
-	wq.n++
-	return nil
-}
-
-// selectNextAccount uses DRR to select the next account to service
 func (wq *DRRWaitQueue) selectNextAccount() string {
 	if len(wq.accounts) == 0 {
 		return ""
@@ -375,6 +354,38 @@ func (wq *DRRWaitQueue) findNextRequestForAccount(accountID string) *WaitingRequ
 	return nil
 }
 
+// Add implements WaitQueue.Add
+func (wq *DRRWaitQueue) Add(wr *WaitingRequest) error {
+	if wq == nil {
+		return ErrWaitQueueNil
+	}
+	if wq.IsFull() {
+		return ErrWaitQueueFull
+	}
+
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	// Initialize account state if needed
+	if _, exists := wq.accounts[wr.ID()]; !exists {
+		wq.accounts[wr.ID()] = &accountState{}
+	}
+
+	if wq.head == nil {
+		wq.head = wr
+	} else {
+		wq.tail.next = wr
+	}
+	wq.tail = wr
+	wr.next = nil
+
+	wq.last = wr.received
+	wq.n++
+	return nil
+}
+
+// selectNextAccount uses DRR to select the next account to service
+
 // Peek implements WaitQueue.Peek
 func (wq *DRRWaitQueue) Peek() *WaitingRequest {
 	//	fmt.Println("Peek")
@@ -411,6 +422,7 @@ func (wq *DRRWaitQueue) Pop() *WaitingRequest {
 
 	accountID := wq.selectNextAccount()
 	if accountID == "" {
+		fmt.Println("No account ID found")
 		return nil
 	}
 
@@ -691,7 +703,7 @@ func NewWaitQueue(max int, stream string) WaitQueue {
 	switch isInference {
 	case true:
 		what = "DRR"
-		wq = NewDRRWaitQueue(max)
+		wq = NewFIFOWaitQueue(max)
 	default:
 		what = "FIFO"
 		wq = NewFIFOWaitQueue(max)

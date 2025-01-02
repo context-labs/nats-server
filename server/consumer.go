@@ -3969,6 +3969,7 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 
 	var pre *WaitingRequest
 	for wr := wq.Peek(); wr != nil; {
+		fmt.Println("Processing waiting request here", wr.ID(), wr.interest)
 		// Check expiration.
 		if (eos && wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
 			hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
