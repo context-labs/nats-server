@@ -5,7 +5,7 @@ Revision 1.1
 Authors: Ivan Kozlovic, Lev Brouk
 
 NATS Server currently supports most of MQTT 3.1.1. This document describes how
-it is implementated.
+it is implemented.
 
 It is strongly recommended to review the [MQTT v3.1.1
 specifications](https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.html)
@@ -582,7 +582,7 @@ to NATS’s `“*”` wildcard, however, MQTT’s wildcard `“#”` is similar 
 that it also includes the level above. That is, a subscription on `“foo/#”` would
 receive messages on `“foo/bar/baz”`, but also on `“foo”`.
 
-So, for MQTT subscriptions enging with a `'#'` we are forced to create 2
+So, for MQTT subscriptions ending with a `'#'` we are forced to create 2
 internal NATS subscriptions, one on `“foo”` and one on `“foo.>”`.
 
 # 5. Known issues
