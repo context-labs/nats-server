@@ -16,9 +16,9 @@
 
 ## Contact
 
-- [Twitter](https://twitter.com/nats_io): Follow us on Twitter!
+- [Twitter](https://twitter.com/nats_io): Follow us on Twitter
 - [Google Groups](https://groups.google.com/forum/#!forum/natsio): Where you can ask questions
-- [Slack](https://natsio.slack.com): Click [here](https://slack.nats.io) to join. You can ask question to our maintainers and to the rich and active community.
+- [Slack](https://natsio.slack.com): Click [here](https://slack.nats.io) to join. You can ask questions to our maintainers and to the rich and active community.
 
 ## Contributing
 
@@ -65,7 +65,7 @@ A third party security audit was performed by Cure53, you can see the full repor
 
 ### Reporting Security Vulnerabilities
 
-If you've found a vulnerability or a potential vulnerability in the NATS server, please let us know at
+If you have found a vulnerability or a potential vulnerability in the NATS server, please let us know at
 [nats-security](mailto:security@nats.io).
 
 ## License
