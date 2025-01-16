@@ -8,9 +8,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/redis/go-redis/v9"
 )
+
+// ----------------------------------------------------------
+// Shared Data Structures
+// ----------------------------------------------------------
 
 // WaitingRequest represents a request in the queue
 type WaitingRequest struct {
@@ -29,7 +31,7 @@ type WaitingRequest struct {
 	priorityGroup *PriorityGroup
 }
 
-// Recycle this request. This request can not be accessed after this call.
+// recycleIfDone recycles this request if n <= 0
 func (wr *WaitingRequest) recycleIfDone() bool {
 	if wr != nil && wr.n <= 0 {
 		wr.recycle()
@@ -38,7 +40,7 @@ func (wr *WaitingRequest) recycleIfDone() bool {
 	return false
 }
 
-// Force a recycle.
+// recycle forces a recycle of this request
 func (wr *WaitingRequest) recycle() {
 	if wr != nil {
 		wr.next, wr.acc, wr.interest, wr.reply = nil, nil, _EMPTY_, _EMPTY_
@@ -46,7 +48,8 @@ func (wr *WaitingRequest) recycle() {
 	}
 }
 
-func (wr *WaitingRequest) ID() string {
+// instanceID extracts a worker/instance ID from wr.reply
+func (wr *WaitingRequest) instanceID() string {
 	if wr != nil && wr.reply != "" {
 		parts := strings.Split(wr.reply, ".")
 		if len(parts) > 1 {
@@ -56,24 +59,24 @@ func (wr *WaitingRequest) ID() string {
 	return ""
 }
 
-// WaitQueue represents a priority queue that handles waiting requests
+// ----------------------------------------------------------
+// WaitQueue Interface
+// ----------------------------------------------------------
+
 type WaitQueue interface {
 	// Add adds a new request to the queue
-	// Returns errWaitQueueFull if the queue is at capacity
 	Add(wr *WaitingRequest) error
 
 	// Peek returns the next request that would be popped without removing it
-	// Returns nil if the queue is empty
 	Peek() *WaitingRequest
 
 	// Tail returns the last request in the queue
 	Tail() *WaitingRequest
 
-	// Pop returns and removes the next request from the queue based on scheduling policy
-	// Returns nil if the queue is empty
+	// Pop returns and removes the next request from the queue
 	Pop() *WaitingRequest
 
-	// Cycle moves the current head request to the end if valid
+	// Cycle moves the current head (or flow) to the end if valid
 	Cycle()
 
 	// IsFull returns true if the queue is at capacity
@@ -96,123 +99,14 @@ type WaitQueue interface {
 
 	// SetLast sets the last active time
 	SetLast(t time.Time)
+
+	// LogFlows prints information about each active flow in this DRRWaitQueue.
+	LogFlows()
 }
 
-// Common errors
-var (
-	ErrWaitQueueFull = errors.New("wait queue is full")
-	ErrWaitQueueNil  = errors.New("wait queue is nil")
-)
-
-// accountState tracks DRR scheduling state for an account
-type accountState struct {
-	weight  int64 // Weight based on account balance
-	deficit int64 // Current deficit in DRR scheduling
-}
-
-var (
-	globalRedis        *redis.Client
-	globalBalanceCache *balanceCache
-	balanceCacheOnce   sync.Once
-	waitQueueMap       = make(map[string]*WaitQueueInfo)
-	waitQueueMutex     sync.RWMutex
-)
-
-// SetGlobalRedis sets up the global Redis client for all wait queues
-func SetGlobalRedis(redisClient *redis.Client) {
-	globalRedis = redisClient
-}
-
-// balanceCache maintains the current account balances and related stats
-type balanceCache struct {
-	sync.RWMutex
-	balances     map[string]float64
-	totalBalance float64
-	lastUpdate   time.Time
-}
-
-// getBalanceCache returns the singleton balance cache instance
-func getBalanceCache() *balanceCache {
-	balanceCacheOnce.Do(func() {
-		// if globalRedis == nil {
-		// 	panic("global Redis client not initialized")
-		// }
-		globalBalanceCache = &balanceCache{
-			balances: make(map[string]float64),
-		}
-		// Start balance updater
-		go globalBalanceCache.balanceUpdater()
-	})
-	return globalBalanceCache
-}
-
-// balanceUpdater periodically updates balances from Redis
-func (bc *balanceCache) balanceUpdater() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		if err := bc.updateBalances(); err != nil {
-			// Handle error, maybe log it
-			continue
-		}
-	}
-}
-
-// updateBalances fetches current balances and updates weights
-func (bc *balanceCache) updateBalances() error {
-	// Fetch balances from Redis
-	balances, err := bc.fetchBalancesFromRedis()
-	if err != nil {
-		return err
-	}
-
-	bc.Lock()
-	defer bc.Unlock()
-
-	// Reset total balance
-	bc.totalBalance = 0
-
-	// Update balances
-	for accountID, balance := range balances {
-		bc.balances[accountID] = balance
-		bc.totalBalance += balance
-	}
-
-	// Remove accounts that no longer exist
-	for accountID := range bc.balances {
-		if _, exists := balances[accountID]; !exists {
-			delete(bc.balances, accountID)
-		}
-	}
-
-	bc.lastUpdate = time.Now()
-	return nil
-}
-
-// getBalance returns the balance and proportion for an account
-func (bc *balanceCache) getBalance(accountID string) (float64, float64) {
-	bc.RLock()
-	defer bc.RUnlock()
-
-	balance := bc.balances[accountID]
-	proportion := 0.0
-	if bc.totalBalance > 0 {
-		proportion = balance / bc.totalBalance
-	}
-	return balance, proportion
-}
-
-// fetchBalancesFromRedis is a placeholder for actual Redis implementation
-func (bc *balanceCache) fetchBalancesFromRedis() (map[string]float64, error) {
-	//	fmt.Println("fetchBalancesFromRedis")
-	// Implement based on your Redis schema
-	balances := map[string]float64{
-		"test-worker-id":   1.0,
-		"test-worker-2-id": 2.0,
-	}
-	return balances, nil
-}
+// ----------------------------------------------------------
+// BaseWaitQueue with shared fields
+// ----------------------------------------------------------
 
 type BaseWaitQueue struct {
 	mu   sync.RWMutex
@@ -223,329 +117,70 @@ type BaseWaitQueue struct {
 	tail *WaitingRequest
 }
 
-// DRRWaitQueue implements WaitQueue using Deficit Round Robin scheduling
-type DRRWaitQueue struct {
-	BaseWaitQueue
+// Common errors
+var (
+	ErrWaitQueueFull = errors.New("wait queue is full")
+	ErrWaitQueueNil  = errors.New("wait queue is nil")
+)
 
-	// DRR scheduling state
-	accounts    map[string]*accountState
-	quantum     int64
-	totalWeight int64
-	bcache      *balanceCache
+// ----------------------------------------------------------
+// Redis, Stake Cache, and Global Map
+// ----------------------------------------------------------
+
+var (
+	// globalRedis      *redis.Client
+	globalStakeCache *stakeCache
+	stakeCacheOnce   sync.Once
+	waitQueueMap     = make(map[string]*WaitQueueInfo)
+	waitQueueMutex   sync.RWMutex
+)
+
+// SetGlobalRedis sets up the global Redis client for all wait queues
+// func SetGlobalRedis(redisClient *redis.Client) {
+// 	globalRedis = redisClient
+// }
+
+// stakeCache maintains the current account balances and related stats
+type stakeCache struct {
+	sync.RWMutex
+	stakeByInstanceID map[string]float64
+	totalStake        float64
+	lastUpdate        time.Time
 }
 
-// NewDRRWaitQueue creates a new DRR-based wait queue with specified maximum capacity
-func NewDRRWaitQueue(max int) *DRRWaitQueue {
-	wq := &DRRWaitQueue{
-		BaseWaitQueue: BaseWaitQueue{
-			max: max,
-		},
-		accounts: make(map[string]*accountState),
-		quantum:  1000, // Base quantum for granular scheduling
-		bcache:   getBalanceCache(),
-	}
-
-	// Start weight updater
-	go wq.weightUpdater()
-
-	return wq
-}
-
-// weightUpdater periodically updates weights based on current balances
-func (wq *DRRWaitQueue) weightUpdater() {
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		wq.updateWeights()
-	}
-}
-
-// updateWeights updates the DRR weights based on current balances
-func (wq *DRRWaitQueue) updateWeights() {
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	// Reset total weight
-	wq.totalWeight = 0
-
-	// Keep track of seen accounts
-	seenAccounts := make(map[string]bool)
-
-	// Update weights for all accounts that have requests
-	current := wq.head
-	for current != nil {
-		accountID := current.ID()
-		seenAccounts[accountID] = true
-
-		balance, _ := wq.bcache.getBalance(accountID)
-
-		state, exists := wq.accounts[accountID]
-		if !exists {
-			state = &accountState{}
-			wq.accounts[accountID] = state
+// getStakeCache returns the singleton stake cache instance
+func getStakeCache() *stakeCache {
+	stakeCacheOnce.Do(func() {
+		// if globalRedis == nil {
+		//     panic("global Redis client not initialized")
+		// }
+		globalStakeCache = &stakeCache{
+			stakeByInstanceID: map[string]float64{
+				"test-worker-id":   1.0,
+				"test-worker-2-id": 2.0,
+			},
+			totalStake: 3.0,
+			lastUpdate: time.Now(),
 		}
-
-		// Update weight
-		state.weight = int64(balance * float64(wq.quantum))
-		if state.weight == 0 {
-			state.weight = 1 // Minimum weight to prevent division by zero
-		}
-		wq.totalWeight += state.weight
-
-		current = current.next
-	}
-
-	// Clean up accounts that no longer have requests
-	for accountID := range wq.accounts {
-		if !seenAccounts[accountID] {
-			delete(wq.accounts, accountID)
-		}
-	}
+	})
+	return globalStakeCache
 }
 
-func (wq *DRRWaitQueue) selectNextAccount() string {
-	if len(wq.accounts) == 0 {
-		return ""
-	}
+// ----------------------------------------------------------
+// FIFOWaitQueue
+// ----------------------------------------------------------
 
-	var selectedID string
-	var minDeficit int64 = math.MaxInt64
-
-	// Select account with lowest deficit
-	for accountID, state := range wq.accounts {
-		if state.deficit < minDeficit {
-			minDeficit = state.deficit
-			selectedID = accountID
-		}
-	}
-
-	if selectedID == "" {
-		return ""
-	}
-
-	// Increase deficit by totalWeight / weight for the selected account
-	if state := wq.accounts[selectedID]; state.weight > 0 {
-		state.deficit += wq.totalWeight / state.weight
-	}
-
-	return selectedID
-}
-
-// findNextRequestForAccount finds the next request for the given account
-func (wq *DRRWaitQueue) findNextRequestForAccount(accountID string) *WaitingRequest {
-	if accountID == "" {
-		return nil
-	}
-
-	current := wq.head
-	for current != nil {
-		if current.ID() == accountID {
-			return current
-		}
-		current = current.next
-	}
-
-	// Reset deficit if no request found
-	if state, exists := wq.accounts[accountID]; exists {
-		state.deficit = 0
-	}
-
-	return nil
-}
-
-// Add implements WaitQueue.Add
-func (wq *DRRWaitQueue) Add(wr *WaitingRequest) error {
-	if wq == nil {
-		return ErrWaitQueueNil
-	}
-	if wq.IsFull() {
-		return ErrWaitQueueFull
-	}
-
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	// Initialize account state if needed
-	if _, exists := wq.accounts[wr.ID()]; !exists {
-		wq.accounts[wr.ID()] = &accountState{}
-	}
-
-	if wq.head == nil {
-		wq.head = wr
-	} else {
-		wq.tail.next = wr
-	}
-	wq.tail = wr
-	wr.next = nil
-
-	wq.last = wr.received
-	wq.n++
-	return nil
-}
-
-// selectNextAccount uses DRR to select the next account to service
-
-// Peek implements WaitQueue.Peek
-func (wq *DRRWaitQueue) Peek() *WaitingRequest {
-	//	fmt.Println("Peek")
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	if wq.IsEmpty() {
-		return nil
-	}
-
-	accountID := wq.selectNextAccount()
-	if accountID == "" {
-		return nil
-	}
-
-	return wq.findNextRequestForAccount(accountID)
-}
-
-// Tail implements WaitQueue.Tail
-func (wq *DRRWaitQueue) Tail() *WaitingRequest {
-	//	fmt.Println("Tail")
-	return wq.tail
-}
-
-// Pop implements WaitQueue.Pop
-func (wq *DRRWaitQueue) Pop() *WaitingRequest {
-	//	fmt.Println("Pop")
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	if wq.IsEmpty() {
-		return nil
-	}
-
-	accountID := wq.selectNextAccount()
-	if accountID == "" {
-		fmt.Println("No account ID found")
-		return nil
-	}
-
-	fmt.Println("Pop HIT", accountID)
-
-	wr := wq.findNextRequestForAccount(accountID)
-	if wr == nil {
-		return nil
-	}
-
-	wr.d++
-	wr.n--
-
-	if wr.n > 0 && wq.n > 1 {
-		wq.RemoveCurrent()
-		wq.Add(wr)
-	} else if wr.n <= 0 {
-		wq.RemoveCurrent()
-	}
-
-	return wr
-}
-
-// Cycle implements WaitQueue.Cycle
-func (wq *DRRWaitQueue) Cycle() {
-	//	fmt.Println("Cycle")
-	wq.mu.Lock()
-	defer wq.mu.Unlock()
-
-	if wq.IsEmpty() || wq.n == 1 {
-		return
-	}
-
-	wr := wq.head
-	if wr == nil {
-		return
-	}
-
-	wq.RemoveCurrent()
-	wq.Add(wr)
-
-	// Reset deficit for this account
-	if state, exists := wq.accounts[wr.ID()]; exists {
-		state.deficit = 0
-	}
-}
-
-// IsFull implements WaitQueue.IsFull
-func (wq *DRRWaitQueue) IsFull() bool {
-	//	fmt.Println("IsFull")
-	if wq == nil {
-		return false
-	}
-	return wq.n == wq.max
-}
-
-// IsEmpty implements WaitQueue.IsEmpty
-func (wq *DRRWaitQueue) IsEmpty() bool {
-	//	fmt.Println("IsEmpty")
-	if wq == nil {
-		return true
-	}
-	return wq.n == 0
-}
-
-// Len implements WaitQueue.Len
-func (wq *DRRWaitQueue) Len() int {
-	//	fmt.Println("Len")
-	if wq == nil {
-		return 0
-	}
-	return wq.n
-}
-
-func (wq *DRRWaitQueue) RemoveCurrent() {
-	//	fmt.Println("RemoveCurrent")
-	wq.Remove(nil, wq.head)
-}
-
-func (wq *DRRWaitQueue) Remove(pre, wr *WaitingRequest) {
-	//	fmt.Println("Remove")
-	if wr == nil {
-		return
-	}
-	if pre != nil {
-		pre.next = wr.next
-	} else if wr == wq.head {
-		wq.head = wr.next
-	}
-	if wr == wq.tail {
-		if wr.next == nil {
-			wq.tail = pre
-		} else {
-			wq.tail = wr.next
-		}
-	}
-	wq.n--
-}
-
-func (wq *DRRWaitQueue) Last() time.Time {
-	//	fmt.Println("Last")
-	return wq.last
-}
-
-// SetLast implements WaitQueue.SetLast
-func (wq *DRRWaitQueue) SetLast(t time.Time) {
-	//	fmt.Println("SetLast")
-	wq.last = t
-}
-
-// FIFOWaitQueue implements WaitQueue using simple FIFO ordering
 type FIFOWaitQueue struct {
 	BaseWaitQueue
 }
 
 // NewFIFOWaitQueue creates a new FIFO-based wait queue
 func NewFIFOWaitQueue(max int) *FIFOWaitQueue {
-	wq := &FIFOWaitQueue{
+	return &FIFOWaitQueue{
 		BaseWaitQueue: BaseWaitQueue{
 			max: max,
 		},
 	}
-	return wq
 }
 
 // Add implements WaitQueue.Add
@@ -553,23 +188,60 @@ func (wq *FIFOWaitQueue) Add(wr *WaitingRequest) error {
 	if wq == nil {
 		return ErrWaitQueueNil
 	}
-	if wq.IsFull() {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	if wq.n >= wq.max {
 		return ErrWaitQueueFull
 	}
+
 	if wq.head == nil {
 		wq.head = wr
 	} else {
 		wq.tail.next = wr
 	}
-	// Always set tail.
 	wq.tail = wr
-	// Make sure nil
 	wr.next = nil
-
-	// Track last active via when we receive a request.
 	wq.last = wr.received
 	wq.n++
 	return nil
+}
+
+// Pop implements WaitQueue.Pop
+func (wq *FIFOWaitQueue) Pop() *WaitingRequest {
+	if wq == nil {
+		return nil
+	}
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	wr := wq.head
+	if wr != nil {
+		wr.d++
+		wr.n--
+		// Remove from front
+		wq.head = wr.next
+		if wq.head == nil {
+			wq.tail = nil
+		}
+		wq.n--
+
+		// If it still has n>0, requeue at the tail
+		if wr.n > 0 {
+			wr.next = nil
+			if wq.head == nil {
+				wq.head = wr
+				wq.tail = wr
+			} else {
+				wq.tail.next = wr
+				wq.tail = wr
+			}
+			wq.n++
+		} else {
+			wr.next = nil
+		}
+	}
+	return wr
 }
 
 // IsFull implements WaitQueue.IsFull
@@ -577,6 +249,8 @@ func (wq *FIFOWaitQueue) IsFull() bool {
 	if wq == nil {
 		return false
 	}
+	wq.mu.RLock()
+	defer wq.mu.RUnlock()
 	return wq.n == wq.max
 }
 
@@ -585,6 +259,8 @@ func (wq *FIFOWaitQueue) IsEmpty() bool {
 	if wq == nil {
 		return true
 	}
+	wq.mu.RLock()
+	defer wq.mu.RUnlock()
 	return wq.n == 0
 }
 
@@ -593,6 +269,8 @@ func (wq *FIFOWaitQueue) Len() int {
 	if wq == nil {
 		return 0
 	}
+	wq.mu.RLock()
+	defer wq.mu.RUnlock()
 	return wq.n
 }
 
@@ -601,6 +279,8 @@ func (wq *FIFOWaitQueue) Peek() *WaitingRequest {
 	if wq == nil {
 		return nil
 	}
+	wq.mu.RLock()
+	defer wq.mu.RUnlock()
 	return wq.head
 }
 
@@ -609,74 +289,495 @@ func (wq *FIFOWaitQueue) Tail() *WaitingRequest {
 	if wq == nil {
 		return nil
 	}
+	wq.mu.RLock()
+	defer wq.mu.RUnlock()
 	return wq.tail
 }
 
 // Cycle implements WaitQueue.Cycle
 func (wq *FIFOWaitQueue) Cycle() {
-	wr := wq.Peek()
+	if wq == nil {
+		return
+	}
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	wr := wq.head
 	if wr != nil {
-		// Always remove current now on a pop, and move to end if still valid.
-		// If we were the only one don't need to remove since this can be a no-op.
-		wq.RemoveCurrent()
+		// Remove from front
+		wq.head = wr.next
+		if wq.head == nil {
+			wq.tail = nil
+		} else {
+			if wq.n > 0 {
+				wq.n--
+			}
+		}
+		// Re-add
 		wq.Add(wr)
 	}
 }
 
-// Pop implements WaitQueue.Pop
-func (wq *FIFOWaitQueue) Pop() *WaitingRequest {
-	wr := wq.Peek()
-	if wr != nil {
-		wr.d++
-		wr.n--
-		// Always remove current now on a pop, and move to end if still valid.
-		// If we were the only one don't need to remove since this can be a no-op.
-		if wr.n > 0 && wq.n > 1 {
-			wq.RemoveCurrent()
-			wq.Add(wr)
-		} else if wr.n <= 0 {
-			wq.RemoveCurrent()
-		}
-	}
-	return wr
-}
-
 // RemoveCurrent implements WaitQueue.RemoveCurrent
 func (wq *FIFOWaitQueue) RemoveCurrent() {
-	wq.Remove(nil, wq.head)
+	wq.Remove(nil, wq.Peek())
 }
 
 // Remove implements WaitQueue.Remove
 func (wq *FIFOWaitQueue) Remove(pre, wr *WaitingRequest) {
+	if wq == nil {
+		return
+	}
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
 	if wr == nil {
 		return
 	}
 	if pre != nil {
 		pre.next = wr.next
 	} else if wr == wq.head {
-		// We are removing head here.
 		wq.head = wr.next
 	}
-	// Check if wr was our tail.
 	if wr == wq.tail {
-		// Check if we need to assign to pre.
 		if wr.next == nil {
 			wq.tail = pre
 		} else {
 			wq.tail = wr.next
 		}
 	}
-	wq.n--
+	if wq.n > 0 {
+		wq.n--
+	}
+	wr.next = nil
 }
 
+// Last implements WaitQueue.Last
 func (wq *FIFOWaitQueue) Last() time.Time {
+	wq.mu.RLock()
+	defer wq.mu.RUnlock()
 	return wq.last
 }
 
 // SetLast implements WaitQueue.SetLast
 func (wq *FIFOWaitQueue) SetLast(t time.Time) {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
 	wq.last = t
 }
+
+// LogFlows implements WaitQueue.LogFlows
+func (wq *FIFOWaitQueue) LogFlows() {
+	fmt.Println("FIFOWaitQueue has no flows")
+}
+
+// ----------------------------------------------------------
+// DRRWaitQueue (Deficit Round Robin) with Single-Item Pop
+// ----------------------------------------------------------
+
+// costOfRequest returns the "cost" for a given request (assume 1).
+func costOfRequest(_ *WaitingRequest) int {
+	return 1
+}
+
+// flow represents per-worker DRR state
+type flow struct {
+	instanceID string
+	head       *WaitingRequest
+	tail       *WaitingRequest
+	next       *flow // for circular linked-list
+	deficit    int   // DRR deficit counter
+	quantum    int   // DRR quantum (stake-based)
+}
+
+// DRRWaitQueue implements WaitQueue using Deficit Round Robin scheduling
+type DRRWaitQueue struct {
+	BaseWaitQueue
+
+	// Protect DRR-specific fields
+	mu sync.Mutex
+
+	flows           map[string]*flow
+	activeFlows     *flow
+	activeFlowsTail *flow
+	current         *flow
+
+	scache      *stakeCache
+	baseQuantum int
+}
+
+// Ensure DRRWaitQueue implements WaitQueue
+var _ WaitQueue = (*DRRWaitQueue)(nil)
+
+// NewDRRWaitQueue creates a new DRRWaitQueue with the given maximum capacity.
+func NewDRRWaitQueue(max int) *DRRWaitQueue {
+	return &DRRWaitQueue{
+		BaseWaitQueue: BaseWaitQueue{
+			max: max,
+		},
+		flows:       make(map[string]*flow),
+		scache:      getStakeCache(),
+		baseQuantum: 1, // quantum = ceil(stake) * baseQuantum
+	}
+}
+
+// quantumForStake returns int(math.Ceil(stake)).
+func (wq *DRRWaitQueue) quantumForStake(stake float64) int {
+	return int(math.Ceil(stake))
+}
+
+// activateFlow inserts the flow f into the circular active list
+func (wq *DRRWaitQueue) activateFlow(f *flow) {
+	if f == nil {
+		return
+	}
+	if wq.activeFlows == nil {
+		// first active flow
+		wq.activeFlows = f
+		wq.activeFlowsTail = f
+		f.next = f // circular
+		if wq.current == nil {
+			wq.current = f
+		}
+		return
+	}
+	// If flow might already be in the list (f.next != nil), skip
+	if f.next != nil {
+		return
+	}
+	// Insert at tail
+	f.next = wq.activeFlows
+	wq.activeFlowsTail.next = f
+	wq.activeFlowsTail = f
+}
+
+// removeFlowFromActive removes flow f from circular list
+func (wq *DRRWaitQueue) removeFlowFromActive(f *flow) {
+	if f == nil || wq.activeFlows == nil {
+		return
+	}
+	// if single flow in list
+	if wq.activeFlows == f && wq.activeFlowsTail == f && f.next == f {
+		wq.activeFlows = nil
+		wq.activeFlowsTail = nil
+		if wq.current == f {
+			wq.current = nil
+		}
+		f.next = nil
+		return
+	}
+	// find predecessor
+	prev := f
+	for prev.next != f {
+		prev = prev.next
+	}
+	prev.next = f.next
+	if wq.activeFlows == f {
+		wq.activeFlows = f.next
+	}
+	if wq.activeFlowsTail == f {
+		wq.activeFlowsTail = prev
+	}
+	if wq.current == f {
+		wq.current = f.next
+	}
+	f.next = nil
+}
+
+// Add enqueues wr into the DRR queue
+func (wq *DRRWaitQueue) Add(wr *WaitingRequest) error {
+	if wr == nil {
+		return ErrWaitQueueNil
+	}
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	if wq.n >= wq.max {
+		return ErrWaitQueueFull
+	}
+
+	instanceID := wr.instanceID()
+	if instanceID == "" {
+		instanceID = "unknown"
+	}
+	stake := wq.scache.stakeByInstanceID[instanceID]
+	if stake < 0 {
+		stake = 0
+	}
+
+	f := wq.flows[instanceID]
+	if f == nil {
+		// create new flow
+		f = &flow{
+			instanceID: instanceID,
+			deficit:    0,
+			quantum:    wq.quantumForStake(stake),
+		}
+		wq.flows[instanceID] = f
+	}
+
+	// enqueue into flow
+	if f.head == nil {
+		f.head = wr
+		f.tail = wr
+		// newly active
+		wq.activateFlow(f)
+	} else {
+		f.tail.next = wr
+		f.tail = wr
+	}
+
+	wq.n++
+	wq.last = wr.received
+	return nil
+}
+
+// Peek returns the next request that would be popped (best effort)
+func (wq *DRRWaitQueue) Peek() *WaitingRequest {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	if wq.activeFlows == nil || wq.current == nil {
+		return nil
+	}
+	return wq.current.head
+}
+
+// Tail returns the last request in the queue
+// We return BaseWaitQueue.tail for completeness
+func (wq *DRRWaitQueue) Tail() *WaitingRequest {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+	return wq.BaseWaitQueue.tail
+}
+
+// Pop returns one request from DRR (partial dispatch)
+func (wq *DRRWaitQueue) Pop() *WaitingRequest {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	if wq.activeFlows == nil {
+		return nil
+	}
+	if wq.current == nil {
+		wq.current = wq.activeFlows
+	}
+
+	count := wq.countActiveFlows()
+	if count == 0 {
+		return nil
+	}
+
+	original := wq.current
+	for i := 0; i < count; i++ {
+		f := wq.current
+
+		// Add quantum to deficit
+		f.deficit += f.quantum
+
+		// If we can afford the head
+		if f.head != nil && costOfRequest(f.head) <= f.deficit {
+			wr := f.head
+			f.head = wr.next
+			if f.head == nil {
+				f.tail = nil
+			}
+			f.deficit -= costOfRequest(wr)
+			wq.n--
+			wr.next = nil
+
+			// if flow is empty now, remove it
+			if f.head == nil {
+				wq.removeFlowFromActive(f)
+			}
+
+			// Rotate to the NEXT flow so we don't keep returning the same flow
+			wq.current = f.next
+			// Return exactly one item
+			return wr
+		}
+
+		// rotate to next flow
+		wq.current = f.next
+		if wq.current == original {
+			break
+		}
+	}
+	// none found
+	return nil
+}
+
+// Cycle moves the current pointer to the next flow
+func (wq *DRRWaitQueue) Cycle() {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	if wq.activeFlows == nil || wq.current == nil {
+		return
+	}
+	wq.current = wq.current.next
+}
+
+// RemoveCurrent removes the request at current flow's head
+func (wq *DRRWaitQueue) RemoveCurrent() {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	if wq.current == nil || wq.current.head == nil {
+		return
+	}
+	wr := wq.current.head
+	wq.removeRequest(wq.current, nil, wr)
+}
+
+// Remove removes a specific request from the queue
+func (wq *DRRWaitQueue) Remove(pre, wr *WaitingRequest) {
+	if wr == nil {
+		return
+	}
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	instanceID := wr.instanceID()
+	if instanceID == "" {
+		instanceID = "unknown"
+	}
+	f := wq.flows[instanceID]
+	if f == nil {
+		return
+	}
+	wq.removeRequest(f, pre, wr)
+}
+
+// removeRequest unlinks wr from flow f
+func (wq *DRRWaitQueue) removeRequest(f *flow, pre, wr *WaitingRequest) {
+	if f == nil || wr == nil {
+		return
+	}
+	if f.head == nil {
+		return
+	}
+
+	if pre == nil {
+		// remove head
+		if wr == f.head {
+			f.head = f.head.next
+			if f.head == nil {
+				f.tail = nil
+			}
+			wq.n--
+			wr.next = nil
+		}
+	} else {
+		// remove mid or tail
+		if pre.next == wr {
+			pre.next = wr.next
+			if wr == f.tail {
+				f.tail = pre
+			}
+			wq.n--
+			wr.next = nil
+		}
+	}
+
+	// if flow empty, remove it
+	if f.head == nil {
+		wq.removeFlowFromActive(f)
+	}
+}
+
+// IsFull returns true if DRR queue is at capacity
+func (wq *DRRWaitQueue) IsFull() bool {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+	return wq.n >= wq.max
+}
+
+// IsEmpty returns true if DRR queue has no items
+func (wq *DRRWaitQueue) IsEmpty() bool {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+	return wq.n == 0
+}
+
+// Len returns the current number of items in DRR
+func (wq *DRRWaitQueue) Len() int {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+	return wq.n
+}
+
+// Last returns the last active time
+func (wq *DRRWaitQueue) Last() time.Time {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+	return wq.last
+}
+
+// SetLast sets the last active time
+func (wq *DRRWaitQueue) SetLast(t time.Time) {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+	wq.last = t
+}
+
+// countActiveFlows returns how many flows are in the active list (circular)
+func (wq *DRRWaitQueue) countActiveFlows() int {
+	if wq.activeFlows == nil {
+		return 0
+	}
+	count := 0
+	start := wq.activeFlows
+	f := start
+	for {
+		count++
+		f = f.next
+		if f == start {
+			break
+		}
+	}
+	return count
+}
+
+// LogFlows prints information about each active flow in this DRRWaitQueue.
+func (wq *DRRWaitQueue) LogFlows() {
+	wq.mu.Lock()
+	defer wq.mu.Unlock()
+
+	// Optionally, log overall queue info:
+	fmt.Printf("==== DRRWaitQueue Debug ====\n")
+	fmt.Printf("Total Requests: %d / Capacity: %d\n", wq.n, wq.max)
+	if wq.activeFlows == nil {
+		fmt.Println("No active flows. (Either empty or flows have no requests.)")
+		return
+	}
+
+	// Walk the circular list of active flows exactly once
+	start := wq.activeFlows
+	f := start
+	for {
+		// Count how many requests are currently in this flow
+		reqCount := 0
+		for wr := f.head; wr != nil; wr = wr.next {
+			reqCount++
+		}
+
+		// Print relevant details
+		fmt.Printf("Flow instance=%q, Deficit=%d, Quantum=%d, Requests=%d\n",
+			f.instanceID, f.deficit, f.quantum, reqCount)
+
+		// Move on to the next flow
+		f = f.next
+		if f == start {
+			break // We’ve looped around
+		}
+	}
+	fmt.Println("================================")
+}
+
+// ----------------------------------------------------------
+// WaitQueueInfo & monitorWaitQueue
+// ----------------------------------------------------------
 
 type WaitQueueInfo struct {
 	wq     WaitQueue
@@ -684,7 +785,7 @@ type WaitQueueInfo struct {
 	what   string
 }
 
-// NewWaitQueue creates a new wait queue of the specified type
+// NewWaitQueue picks DRR for inference streams, FIFO otherwise
 func NewWaitQueue(max int, stream string) WaitQueue {
 	fmt.Println("NewWaitQueue:", stream)
 
@@ -700,23 +801,20 @@ func NewWaitQueue(max int, stream string) WaitQueue {
 
 	var what string
 	var wq WaitQueue
-	switch isInference {
-	case true:
+	if isInference {
 		what = "DRR"
-		wq = NewFIFOWaitQueue(max)
-	default:
+		wq = NewDRRWaitQueue(max)
+	} else {
 		what = "FIFO"
 		wq = NewFIFOWaitQueue(max)
 	}
 
-	// Create new WaitQueueInfo and store in map
 	info := &WaitQueueInfo{
 		wq:     wq,
 		stream: stream,
 		what:   what,
 	}
 	waitQueueMap[stream] = info
-
 	monitorWaitQueue()
 
 	return wq
@@ -733,18 +831,23 @@ func monitorWaitQueue() {
 	go func() {
 		for range time.Tick(1 * time.Second) {
 			fmt.Println("--------------------------------")
-			// Create sorted slice of streams
+			// gather streams, sorted
+			waitQueueMutex.RLock()
 			streams := make([]string, 0, len(waitQueueMap))
-			for stream := range waitQueueMap {
-				streams = append(streams, stream)
+			for s := range waitQueueMap {
+				streams = append(streams, s)
 			}
+			waitQueueMutex.RUnlock()
 			sort.Strings(streams)
 
-			// Print in sorted order
-			for _, stream := range streams {
-				info := waitQueueMap[stream]
-				fmt.Printf("| %-4s | %-4d | %-40s |\n", info.what, info.wq.Len(), info.stream)
+			// print in sorted order
+			waitQueueMutex.RLock()
+			for _, s := range streams {
+				info := waitQueueMap[s]
+				// fmt.Printf("| %-4s | %-4d | %-40s |\n", info.what, info.wq.Len(), info.stream)
+				info.wq.LogFlows()
 			}
+			waitQueueMutex.RUnlock()
 			fmt.Println("--------------------------------")
 		}
 	}()

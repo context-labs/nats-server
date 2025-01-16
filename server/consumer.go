@@ -3415,7 +3415,7 @@ func (o *consumer) nextWaiting(sz int) *WaitingRequest {
 	}
 
 	lastRequest := o.waiting.Tail()
-	for wr := o.waiting.Peek(); wr != nil; wr = wr.next {
+	for wr := o.waiting.Peek(); !o.waiting.IsEmpty(); wr = o.waiting.Peek() {
 		if wr == nil {
 			break
 		}
@@ -3710,7 +3710,7 @@ func (o *consumer) processNextMsgRequest(reply string, msg []byte) {
 	wr.b = maxBytes
 	wr.received = time.Now()
 
-	fmt.Println("Adding waiting request for consumer ", o.name, "on stream ", o.stream, "with reply ", reply, "and interest ", interest, "and claim ", acc.claimJWT)
+	// fmt.Println("Adding waiting request for consumer ", o.name, "on stream ", o.stream, "with reply ", reply, "and interest ", interest, "and claim ", acc.claimJWT)
 	if err := o.waiting.Add(wr); err != nil {
 		sendErr(409, "Exceeded MaxWaiting")
 		wr.recycle()
@@ -3969,7 +3969,7 @@ func (o *consumer) processWaiting(eos bool) (int, int, int, time.Time) {
 
 	var pre *WaitingRequest
 	for wr := wq.Peek(); wr != nil; {
-		fmt.Println("Processing waiting request here", wr.ID(), wr.interest)
+		// fmt.Println("Processing waiting request here", wr.instanceID(), wr.interest)
 		// Check expiration.
 		if (eos && wr.noWait && wr.d > 0) || (!wr.expires.IsZero() && now.After(wr.expires)) {
 			hdr := fmt.Appendf(nil, "NATS/1.0 408 Request Timeout\r\n%s: %d\r\n%s: %d\r\n\r\n", JSPullRequestPendingMsgs, wr.n, JSPullRequestPendingBytes, wr.b)
