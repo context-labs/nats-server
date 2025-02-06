@@ -16,7 +16,7 @@
 
 ## Contact
 
-- [Twitter](https://twitter.com/nats_io): Follow us on Twitter!
+- [Twitter](https://x.com/nats_io): Follow us on Twitter!
 - [Google Groups](https://groups.google.com/forum/#!forum/natsio): Where you can ask questions
 - [Slack](https://natsio.slack.com): Click [here](https://slack.nats.io) to join. You can ask question to our maintainers and to the rich and active community.
 
