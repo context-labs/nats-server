@@ -1,0 +1,44 @@
+FROM golang:1.22-alpine AS builder
+
+ARG VERSION="nightly"
+
+RUN apk add --update git
+
+WORKDIR /src
+
+# Copy go.mod and go.sum first (if they exist) to cache dependencies
+COPY go.mod go.sum* ./
+RUN go mod download
+
+# Clone natscli separately to cache it
+RUN mkdir -p src/github.com/nats-io && \
+    cd src/github.com/nats-io/ && \
+    git clone https://github.com/nats-io/natscli.git && \
+    cd natscli/nats && \
+    go mod download
+
+# Install nsc separately to cache it
+RUN go install github.com/nats-io/nsc/v2@latest
+
+# Now copy the rest of the source code and build
+COPY . .
+
+RUN go build -ldflags "-w -X main.version=${VERSION}" -o /nats-server
+
+# Build nats cli
+RUN cd src/github.com/nats-io/natscli/nats && \
+    go build -ldflags "-w -X main.version=${VERSION}" -o /nats
+
+FROM alpine:latest
+
+RUN apk add --update ca-certificates && mkdir -p /nats/bin && mkdir /nats/conf
+
+COPY docker/nats-server.conf /nats/conf/nats-server.conf
+COPY --from=builder /nats-server /bin/nats-server
+COPY --from=builder /nats /bin/nats
+COPY --from=builder /go/bin/nsc /bin/nsc
+
+EXPOSE 4222 8222 6222 5222
+
+ENTRYPOINT ["/bin/nats-server"]
+CMD ["-c", "/nats/conf/nats-server.conf"]

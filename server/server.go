@@ -2179,7 +2179,7 @@ func (s *Server) fetchAccount(name string) (*Account, error) {
 // WaitForShutdown can be used to block and wait for the server to shutdown properly if needed
 // after calling s.Shutdown()
 func (s *Server) Start() {
-	s.Noticef("Starting nats-server")
+	s.Noticef("Starting kuzco-nats-server")
 
 	gc := gitCommit
 	if gc == _EMPTY_ {
